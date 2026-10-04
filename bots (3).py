@@ -40,7 +40,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 import os
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 try:
     from tokens import BOT_TOKEN
 except ImportError:
