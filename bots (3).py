@@ -39,8 +39,12 @@ from aiogram.types import (
     PreCheckoutQuery,
     ReplyKeyboardMarkup,
 )
+import os
 
-from tokens import BOT_TOKEN
+try:
+    from tokens import BOT_TOKEN
+except ImportError:
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # ===========================================================================
 # НАСТРОЙКИ
