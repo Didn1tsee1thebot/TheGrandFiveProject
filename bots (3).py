@@ -17,12 +17,15 @@ import logging
 import math
 import random
 import re
+import shutil
+import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -32,6 +35,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
     InputMediaPhoto,
     LabeledPrice,
     KeyboardButton,
@@ -41,16 +45,34 @@ from aiogram.types import (
 )
 import os
 
-try:
-    from tokens import BOT_TOKEN
-except ImportError:
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
+from aiohttp import web
+
+
+def _load_token() -> str:
+    """Токен берётся из переменной окружения BOT_TOKEN, а если её нет, из tokens.py."""
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        try:
+            from tokens import BOT_TOKEN as file_token
+            token = (file_token or "").strip()
+        except ImportError:
+            token = ""
+    if not token:
+        sys.exit(
+            "Не найден токен бота. Задай переменную окружения BOT_TOKEN "
+            "или создай файл tokens.py со строкой BOT_TOKEN = \"твой_токен\""
+        )
+    return token
+
+
+BOT_TOKEN = _load_token()
 
 # ===========================================================================
 # НАСТРОЙКИ
 # ===========================================================================
 
-DB_PATH = "game.db"
+# Путь к базе. На сервере можно задать переменной DB_PATH (например /data/game.db)
+DB_PATH = os.getenv("DB_PATH", "game.db")
 
 # Папка media ищется рядом с файлом bots.py (а не там, откуда запущен пайчарм)
 BASE_DIR = Path(sys.argv[0]).resolve().parent
@@ -706,14 +728,16 @@ def aggregate_inventory(inventory: dict[str, int]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Донат: звёзды Telegram, оплата картой, VIP и косметика
 # ---------------------------------------------------------------------------
-ADMIN_IDS: list[int] = [6103793904]        # впиши сюда свой Telegram id: нужен для /give и /refund
-SUPPORT_CONTACT = "@gitdad"    # куда писать по вопросам оплаты (впиши свой ник!)
+ADMIN_IDS: list[int] = [
+    int(x) for x in os.getenv("ADMIN_IDS", "6103793904").replace(" ", "").split(",") if x
+]  # твой Telegram id (можно несколько через запятую): нужен для /give, /refund, /backup
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@gitdad")  # куда писать по вопросам оплаты
 CASINO_ENABLED = True            # False закроет казино, если решишь не мешать его с донатом
 
 # Оплата картой идёт ВНЕ Telegram: по ссылке на платёжную страницу (Boosty, ЮMoney,
 # CloudTips и т.п.). Товар после проверки платежа выдаёшь ты командой /give.
-CARD_PAY_URL = "https://t.me/tribute/app?startapp=dRzj"  # ссылка на оплату. Пусто = кнопка оплаты картой скрыта
-CARD_CURRENCY = "€"              # валюта, в которой показывается цена картой
+CARD_PAY_URL = os.getenv("CARD_PAY_URL", "https://t.me/tribute/app?startapp=dRzj")  # ссылка на оплату картой. Пусто = кнопка скрыта
+CARD_CURRENCY = os.getenv("CARD_CURRENCY", "€")  # валюта цены при оплате картой
 CARD_PRICE_PER_STAR = 1.5        # цена одной звезды при оплате картой
 CARD_CLAIM_COOLDOWN = 120        # раз в сколько секунд игрок может нажать «Я оплатил»
 
@@ -2631,7 +2655,7 @@ ASK_NICK_TEXT = (
 # ===========================================================================
 
 # Стоит первым, чтобы любой текст в момент ввода ника считался ником
-@router.message(StateFilter(Registration.nickname), F.text)
+@router.message(StateFilter(Registration.nickname), F.text, ~F.text.startswith("/"))
 async def process_nickname(message: Message, state: FSMContext) -> None:
     nick = message.text.strip()
 
@@ -3714,6 +3738,7 @@ async def on_successful_payment(message: Message) -> None:
         await message.answer("Не нашёл твой аккаунт в игре, звёзды возвращены. Напиши /start.")
         return
 
+    backup_soon(message.bot, "платёж")
     await message.answer(
         await success_text(tg_id, product, granted, charge_id),
         reply_markup=inline([[("✨ Стиль", "menu:style"), ("⬅️ Профиль", "menu:profile")]]),
@@ -3793,6 +3818,7 @@ async def cb_card_paid(call: CallbackQuery) -> None:
 async def cmd_give(message: Message) -> None:
     """Только для админа: /give <id игрока> <товар>. Выдаёт товар за оплату картой."""
     if message.from_user.id not in ADMIN_IDS:
+        await deny_not_admin(message)
         return
 
     parts = (message.text or "").split()
@@ -3814,6 +3840,7 @@ async def cmd_give(message: Message) -> None:
         await message.answer("Не нашёл игрока с таким id в игре")
         return
 
+    backup_soon(message.bot, "выдача /give")
     try:
         await message.bot.send_message(tg_id, await success_text(tg_id, product, granted, charge_id))
     except Exception:
@@ -3842,6 +3869,7 @@ async def cmd_terms(message: Message) -> None:
 async def cmd_refund(message: Message) -> None:
     """Только для админа: /refund <номер платежа>. Возвращает деньги и списывает выданное."""
     if message.from_user.id not in ADMIN_IDS:
+        await deny_not_admin(message)
         return
 
     parts = (message.text or "").split()
@@ -3957,22 +3985,303 @@ async def cb_style_equip(call: CallbackQuery) -> None:
 
 
 # ===========================================================================
+# ХРАНЕНИЕ БАЗЫ В TELEGRAM И ЗДОРОВЬЕ СЕРВЕРА
+# ===========================================================================
+# На бесплатных хостингах диск временный: при перезапуске game.db пропадает.
+# Поэтому бот сам кладёт копию базы в закреплённое сообщение в личке с админом
+# (одно и то же сообщение, файл в нём заменяется) и при старте без базы
+# забирает её оттуда. Нужно один раз написать боту /start с аккаунта админа.
+
+# По умолчанию включено только на хостинге (там задан PORT). Дома, в пайчарме, выключено,
+# чтобы твоя тестовая база случайно не затёрла копию с сервера. Принудительно: BACKUP_ENABLED=1
+BACKUP_ENABLED = os.getenv("BACKUP_ENABLED", "1" if os.getenv("PORT") else "0") != "0"
+BACKUP_CHAT_ID = int(os.getenv("BACKUP_CHAT_ID", "0") or 0) or (ADMIN_IDS[0] if ADMIN_IDS else 0)
+BACKUP_MIN_INTERVAL = 180        # не чаще раза в 3 минуты, если игроки что-то делают
+BOT_VERSION = "2026-10-04-b"     # по ней видно, какая версия кода сейчас запущена
+BACKUP_MARK = "#gamedb"          # по этой метке бот узнаёт своё сообщение с базой
+BACKUP = {"message_id": 0, "dirty": False, "last": 0.0}
+BACKUP_LOCK = asyncio.Lock()
+
+
+class MarkDirty(BaseMiddleware):
+    """После любого действия игрока помечает базу как изменённую."""
+
+    async def __call__(self, handler, event, data):
+        try:
+            return await handler(event, data)
+        finally:
+            BACKUP["dirty"] = True
+
+
+def _snapshot_sync(dest: Path) -> None:
+    """Безопасная копия базы, даже если в неё сейчас пишут."""
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(dest)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
+def _db_stats(path: Path) -> tuple[int, int]:
+    """(игроков, платежей) в файле базы."""
+    con = sqlite3.connect(path)
+    try:
+        players = con.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+        try:
+            payments = con.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
+        except sqlite3.Error:
+            payments = 0
+        return players, payments
+    finally:
+        con.close()
+
+
+def _valid_db(path: Path) -> bool:
+    try:
+        con = sqlite3.connect(path)
+        try:
+            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                return False
+            con.execute("SELECT COUNT(*) FROM players").fetchone()
+            return True
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+
+async def push_backup(bot: Bot, reason: str = "") -> bool:
+    """Заменяет файл базы в закреплённом сообщении (или создаёт его в первый раз)."""
+    if not BACKUP_ENABLED or not BACKUP_CHAT_ID or not Path(DB_PATH).exists():
+        return False
+
+    async with BACKUP_LOCK:
+        tmp = Path(tempfile.gettempdir()) / "game_backup.db"
+        try:
+            await asyncio.to_thread(_snapshot_sync, tmp)
+            players, payments = await asyncio.to_thread(_db_stats, tmp)
+            if players == 0:
+                return False  # пустую базу не сохраняем, чтобы не затереть хорошую копию
+
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+            caption = f"{BACKUP_MARK} {stamp} UTC\nИгроков: {players}, платежей: {payments}"
+            if reason:
+                caption += f"\n({reason})"
+
+            if BACKUP["message_id"]:
+                try:
+                    await bot.edit_message_media(
+                        chat_id=BACKUP_CHAT_ID,
+                        message_id=BACKUP["message_id"],
+                        media=InputMediaDocument(
+                            media=FSInputFile(tmp, filename="game.db"), caption=caption
+                        ),
+                    )
+                    BACKUP["last"] = time.time()
+                    return True
+                except TelegramBadRequest:
+                    logging.warning("Сообщение с базой не удалось изменить, отправлю новое")
+                    BACKUP["message_id"] = 0
+
+            sent = await bot.send_document(
+                BACKUP_CHAT_ID, FSInputFile(tmp, filename="game.db"), caption=caption
+            )
+            BACKUP["message_id"] = sent.message_id
+            try:
+                await bot.pin_chat_message(
+                    BACKUP_CHAT_ID, sent.message_id, disable_notification=True
+                )
+            except Exception:
+                logging.exception("Не удалось закрепить сообщение с базой")
+            BACKUP["last"] = time.time()
+            return True
+        except Exception:
+            logging.exception("Не удалось сделать бэкап")
+            return False
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def backup_soon(bot: Bot, reason: str) -> None:
+    """Сохранить базу прямо сейчас, не задерживая ответ игроку (например, после оплаты)."""
+    task = asyncio.create_task(push_backup(bot, reason))
+    TASKS.add(task)
+    task.add_done_callback(TASKS.discard)
+
+
+async def backup_loop(bot: Bot) -> None:
+    """Раз в полминуты смотрит, были ли изменения, и сохраняет базу не чаще BACKUP_MIN_INTERVAL."""
+    while True:
+        await asyncio.sleep(30)
+        if BACKUP["dirty"] and time.time() - BACKUP["last"] >= BACKUP_MIN_INTERVAL:
+            BACKUP["dirty"] = False
+            if not await push_backup(bot):
+                BACKUP["dirty"] = True
+
+
+async def restore_from_telegram(bot: Bot) -> str:
+    """
+    Забирает базу из закреплённого сообщения.
+    Вернёт 'restored', 'none' (копии нет, можно начинать с чистой базы) или 'error'.
+    """
+    if not BACKUP_ENABLED or not BACKUP_CHAT_ID:
+        return "none"
+    try:
+        chat = await bot.get_chat(BACKUP_CHAT_ID)
+    except TelegramBadRequest:
+        return "none"  # админ ещё ни разу не писал боту, копии быть не может
+    except Exception:
+        logging.exception("Не удалось связаться с Telegram за базой")
+        return "error"
+
+    pinned = chat.pinned_message
+    if not pinned or not pinned.document or not (pinned.caption or "").startswith(BACKUP_MARK):
+        return "none"
+
+    tmp = Path(tempfile.gettempdir()) / "game_restore.db"
+    try:
+        await bot.download(pinned.document, destination=tmp)
+        if not await asyncio.to_thread(_valid_db, tmp):
+            logging.error("Файл базы из Telegram повреждён")
+            return "error"
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp), DB_PATH)
+        BACKUP["message_id"] = pinned.message_id
+        return "restored"
+    except Exception:
+        logging.exception("Не удалось восстановить базу")
+        return "error"
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def deny_not_admin(message: Message) -> None:
+    await message.answer(
+        "⛔ Эта команда только для админа.\n"
+        f"Твой Telegram id: {message.from_user.id}\n"
+        "Если админ это ты, впиши этот id в ADMIN_IDS (переменная на сервере или строка в коде)."
+    )
+
+
+@router.message(Command("myid"))
+async def cmd_myid(message: Message) -> None:
+    """Показывает твой Telegram id и состояние бота. Удобно, чтобы проверить настройки."""
+    is_admin = message.from_user.id in ADMIN_IDS
+    await message.answer(
+        f"Твой Telegram id: {message.from_user.id}\n"
+        f"Админ: {'да' if is_admin else 'нет'}\n"
+        f"Версия бота: {BOT_VERSION}\n"
+        f"Бэкап в Telegram: {'вкл' if BACKUP_ENABLED else 'выкл'}"
+    )
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message) -> None:
+    """Только для админа: сохранить базу в Telegram прямо сейчас."""
+    if message.from_user.id not in ADMIN_IDS:
+        await deny_not_admin(message)
+        return
+    ok = await push_backup(message.bot, "вручную")
+    await message.answer("✅ База сохранена в закреплённое сообщение" if ok else "❌ Не получилось, смотри логи")
+
+
+@router.message(F.document & F.caption.startswith("/restore"))
+async def cmd_restore(message: Message) -> None:
+    """Только для админа: пришли файл game.db с подписью /restore, и база заменится."""
+    if message.from_user.id not in ADMIN_IDS:
+        await deny_not_admin(message)
+        return
+
+    tmp = Path(tempfile.gettempdir()) / "game_upload.db"
+    try:
+        await message.bot.download(message.document, destination=tmp)
+        if not await asyncio.to_thread(_valid_db, tmp):
+            await message.answer("❌ Это не похоже на базу игры, ничего не менял")
+            return
+        players, payments = await asyncio.to_thread(_db_stats, tmp)
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp), DB_PATH)
+        await init_db()  # на случай, если база старой версии
+        await message.answer(f"✅ База заменена. Игроков: {players}, платежей: {payments}")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def start_health_server():
+    """
+    Маленький веб-сервер для хостингов, которым нужен открытый порт (переменная PORT).
+    По адресу / отвечает «ok»: его можно пинговать, чтобы бесплатный хостинг не засыпал.
+    """
+    port = int(os.getenv("PORT", "0") or 0)
+    if not port:
+        return None
+
+    async def alive(request):
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", alive)
+    app.router.add_get("/health", alive)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logging.info("Веб-сервер для проверки здоровья слушает порт %s", port)
+    return runner
+
+
+# ===========================================================================
 # ЗАПУСК
 # ===========================================================================
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.info(
+        "Запуск бота. Версия: %s. Админы: %s. Бэкап в Telegram: %s. Файл базы: %s",
+        BOT_VERSION, ADMIN_IDS, "вкл" if BACKUP_ENABLED else "выкл", DB_PATH,
+    )
 
-    await init_db()
     MEDIA_DIR.mkdir(exist_ok=True)
     check_media()
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    dp.update.outer_middleware(MarkDirty())
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    # Порт открываем первым делом: хостинги ждут его при старте
+    health_runner = await start_health_server()
+
+    # Нет базы (например, на бесплатном хостинге после перезапуска): забираем копию из Telegram
+    if not Path(DB_PATH).exists():
+        result = "none"
+        for attempt in range(5):
+            result = await restore_from_telegram(bot)
+            if result != "error":
+                break
+            await asyncio.sleep(5)
+        if result == "error":
+            # Лучше упасть и перезапуститься, чем начать с пустой базой и затереть копию
+            raise SystemExit("Не удалось забрать базу из Telegram, останавливаюсь")
+        logging.info(
+            "База восстановлена из Telegram" if result == "restored"
+            else "Копии базы нет, начинаю с чистой"
+        )
+
+    await init_db()
+
+    backup_task = asyncio.create_task(backup_loop(bot))
+    try:
+        # Не сбрасываем накопившиеся апдейты: среди них могут быть оплаты, пока бот спал
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot)
+    finally:
+        backup_task.cancel()
+        await push_backup(bot, "остановка бота")
+        if health_runner:
+            await health_runner.cleanup()
+        await bot.session.close()
 
 
 # Запуск без проверки имени модуля, чтобы не зависеть от подчёркиваний
