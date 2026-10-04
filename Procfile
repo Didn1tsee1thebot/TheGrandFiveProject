@@ -1,0 +1,1 @@
+worker: python "bots (3).py"
