@@ -1,0 +1,5 @@
+tokens.py
+.venv/
+game.db
+__pycache__/
+.idea/
