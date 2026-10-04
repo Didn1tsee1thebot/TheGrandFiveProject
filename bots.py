@@ -986,7 +986,8 @@ async def init_db() -> None:
                 eq_badge   TEXT NOT NULL DEFAULT '',
                 eq_title   TEXT NOT NULL DEFAULT '',
                 eq_theme   TEXT NOT NULL DEFAULT '',
-                eq_effect  TEXT NOT NULL DEFAULT ''
+                eq_effect  TEXT NOT NULL DEFAULT '',
+                tg_username TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -997,6 +998,18 @@ async def init_db() -> None:
                 tg_id    INTEGER NOT NULL,
                 house_id INTEGER NOT NULL,
                 PRIMARY KEY (tg_id, house_id)
+            )
+            """
+        )
+        # журнал подарков от админа
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gifts (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                tg_id    INTEGER NOT NULL,
+                amount   INTEGER NOT NULL,
+                ts       INTEGER NOT NULL
             )
             """
         )
@@ -1068,6 +1081,7 @@ async def init_db() -> None:
             "eq_title": "TEXT NOT NULL DEFAULT ''",
             "eq_theme": "TEXT NOT NULL DEFAULT ''",
             "eq_effect": "TEXT NOT NULL DEFAULT ''",
+            "tg_username": "TEXT NOT NULL DEFAULT ''",
         }
         async with db.execute("PRAGMA table_info(players)") as cur:
             existing = [row[1] for row in await cur.fetchall()]
@@ -1146,16 +1160,66 @@ async def get_player(tg_id: int) -> dict | None:
         return player
 
 
-async def create_player(tg_id: int, nickname: str) -> None:
+async def create_player(tg_id: int, nickname: str, username: str = "") -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO players (tg_id, nickname, balance) VALUES (?, ?, ?)",
-            (tg_id, nickname, START_BALANCE),
+            "INSERT INTO players (tg_id, nickname, balance, tg_username) VALUES (?, ?, ?, ?)",
+            (tg_id, nickname, START_BALANCE, username or ""),
         )
         await db.commit()
 
 
-NEEDS_LOCK = asyncio.Lock()
+async def remember_username(tg_id: int, username: str | None) -> None:
+    """Обновляет юзернейм игрока (нужен, чтобы находить его по @нику)."""
+    username = username or ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE players SET tg_username = ? WHERE tg_id = ? AND tg_username != ?",
+            (username, tg_id, username),
+        )
+        await db.commit()
+
+
+async def find_player(query: str) -> dict | None:
+    """Ищет игрока по Telegram id, @юзернейму или нику в игре."""
+    query = query.strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if query.isdigit():
+            sql, args = "SELECT tg_id, nickname FROM players WHERE tg_id = ?", (int(query),)
+        elif query.startswith("@"):
+            sql, args = (
+                "SELECT tg_id, nickname FROM players "
+                "WHERE tg_username != '' AND LOWER(tg_username) = LOWER(?)",
+                (query[1:],),
+            )
+        else:
+            sql, args = (
+                "SELECT tg_id, nickname FROM players WHERE LOWER(nickname) = LOWER(?)",
+                (query,),
+            )
+        async with db.execute(sql, args) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def gift_money(admin_id: int, tg_id: int, amount: int) -> int | None:
+    """Дарит игроку деньги и пишет в журнал. Вернёт новый баланс или None, если игрока нет."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE players SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id)
+        )
+        if cur.rowcount == 0:
+            await db.rollback()
+            return None
+        await db.execute(
+            "INSERT INTO gifts (admin_id, tg_id, amount, ts) VALUES (?, ?, ?, ?)",
+            (admin_id, tg_id, amount, int(time.time())),
+        )
+        async with db.execute("SELECT balance FROM players WHERE tg_id = ?", (tg_id,)) as c:
+            (balance,) = await c.fetchone()
+        await db.commit()
+        return balance
 
 
 async def use_item(tg_id: int, key: str) -> tuple[str, float, float, int]:
@@ -2666,7 +2730,7 @@ async def process_nickname(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        await create_player(message.from_user.id, nick)
+        await create_player(message.from_user.id, nick, message.from_user.username or "")
     except aiosqlite.IntegrityError:
         await message.answer("Этот ник уже занят, придумай другой.")
         return
@@ -2684,6 +2748,7 @@ async def process_nickname(message: Message, state: FSMContext) -> None:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     player = await get_player(message.from_user.id)
     if player:
+        await remember_username(message.from_user.id, message.from_user.username)
         await send_card(
             message,
             f"С возвращением в Лос-Сантос, {player['nickname']}!",
@@ -3997,7 +4062,7 @@ async def cb_style_equip(call: CallbackQuery) -> None:
 BACKUP_ENABLED = os.getenv("BACKUP_ENABLED", "1" if os.getenv("PORT") else "0") != "0"
 BACKUP_CHAT_ID = int(os.getenv("BACKUP_CHAT_ID", "0") or 0) or (ADMIN_IDS[0] if ADMIN_IDS else 0)
 BACKUP_MIN_INTERVAL = 180        # не чаще раза в 3 минуты, если игроки что-то делают
-BOT_VERSION = "2026-10-04-b"     # по ней видно, какая версия кода сейчас запущена
+BOT_VERSION = "2026-10-04-c"     # по ней видно, какая версия кода сейчас запущена
 BACKUP_MARK = "#gamedb"          # по этой метке бот узнаёт своё сообщение с базой
 BACKUP = {"message_id": 0, "dirty": False, "last": 0.0}
 BACKUP_LOCK = asyncio.Lock()
@@ -4168,6 +4233,7 @@ async def deny_not_admin(message: Message) -> None:
 @router.message(Command("myid"))
 async def cmd_myid(message: Message) -> None:
     """Показывает твой Telegram id и состояние бота. Удобно, чтобы проверить настройки."""
+    await remember_username(message.from_user.id, message.from_user.username)
     is_admin = message.from_user.id in ADMIN_IDS
     await message.answer(
         f"Твой Telegram id: {message.from_user.id}\n"
@@ -4207,6 +4273,56 @@ async def cmd_restore(message: Message) -> None:
         await message.answer(f"✅ База заменена. Игроков: {players}, платежей: {payments}")
     finally:
         tmp.unlink(missing_ok=True)
+
+
+@router.message(Command("gift"))
+async def cmd_gift(message: Message) -> None:
+    """Только для админа: /gift КОМУ СУММА. КОМУ: Telegram id, @юзернейм или ник в игре."""
+    if message.from_user.id not in ADMIN_IDS:
+        await deny_not_admin(message)
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[2].isdigit():
+        await message.answer(
+            "Используй: /gift КОМУ СУММА\n"
+            "КОМУ: Telegram id, @юзернейм или ник в игре\n"
+            "Пример: /gift @username 50000"
+        )
+        return
+
+    amount = int(parts[2])
+    if not 1 <= amount <= 1_000_000_000:
+        await message.answer("Сумма должна быть от 1 до 1 000 000 000")
+        return
+
+    target = await find_player(parts[1])
+    if not target:
+        await message.answer(
+            "Игрока не нашёл. Он должен написать боту /start и зарегистрироваться "
+            "(если уже зарегистрирован, пусть ещё раз нажмёт /start). "
+            "Можно искать и по Telegram id или нику в игре."
+        )
+        return
+
+    balance = await gift_money(message.from_user.id, target["tg_id"], amount)
+    if balance is None:
+        await message.answer("Не получилось: игрок пропал из базы")
+        return
+
+    backup_soon(message.bot, "подарок")
+    try:
+        await message.bot.send_message(
+            target["tg_id"],
+            f"🎁 Тебе подарили {money(amount)} $!\nБаланс: {money(balance)} $",
+        )
+        note = "Игроку отправлено уведомление."
+    except Exception:
+        note = "Уведомление не дошло (игрок мог заблокировать бота), но деньги начислены."
+    await message.answer(
+        f"✅ Подарено {money(amount)} $ игроку {target['nickname']} (id {target['tg_id']}).\n"
+        f"Его баланс: {money(balance)} $.\n{note}"
+    )
 
 
 async def start_health_server():
